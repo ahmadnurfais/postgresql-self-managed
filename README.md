@@ -35,6 +35,12 @@ nano .env          # set POSTGRES_PASSWORD and PG_APP_PASSWORD
 sudo ./init.sh
 ```
 
+Run `init.sh` before any `docker compose up`. It renders `pgbackrest.conf` before starting the
+container, and Docker creates a **directory** at a bind-mount source that does not exist. Starting
+the stack first therefore produces a root-owned directory where that config belongs, and every
+`archive-push` then fails with `Is a directory` while PostgreSQL itself looks perfectly healthy.
+Recovering means `docker compose down`, `rm -rf` that directory as root, then `init.sh`.
+
 `init.sh` requires root: it creates `/opt/databases/postgresql` and chowns it to uid 999, the
 postgres container user. It is idempotent. Re-running it against a live instance renders the
 pgBackRest config again, resets both passwords to whatever `.env` currently holds, reports what
