@@ -1,0 +1,13 @@
+[Unit]
+Description=pgBackRest %i backup of the PostgreSQL cluster
+Documentation=file:///opt/postgresql-self-managed/README.md
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+# Replace with the absolute path to this repository on the server.
+WorkingDirectory=/opt/postgresql-self-managed
+# %i is the instance name: the part after @ in postgres-backup@diff.service.
+ExecStart=/opt/postgresql-self-managed/backup.sh %i

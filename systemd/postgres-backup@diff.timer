@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily pgBackRest differential backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Runs a missed backup at next boot instead of skipping the day.
+Persistent=true
+RandomizedDelaySec=900
+Unit=postgres-backup@diff.service
+
+[Install]
+WantedBy=timers.target

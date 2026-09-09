@@ -1,0 +1,70 @@
+services:
+  postgres:
+    build:
+      context: .
+    image: postgres-pgbackrest:18.6
+    container_name: postgres
+    restart: always
+    # The image entrypoint never touches postgresql.conf, so pointing at a
+    # mounted file makes this repository the single source of truth for tuning.
+    # postgresql.auto.conf in PGDATA is still read afterwards, so ALTER SYSTEM
+    # keeps working.
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      # Fixed at initdb time and changeable only by dump and reload. The builtin
+      # provider sorts by code point, needs no external library, and is immune to
+      # the glibc collation changes that silently invalidate text indexes.
+      POSTGRES_INITDB_ARGS: >-
+        --locale-provider=builtin
+        --builtin-locale=C.UTF-8
+        --encoding=UTF8
+    volumes:
+      - /opt/databases/postgresql/data:/var/lib/postgresql
+      - /opt/databases/postgresql/backups:/var/lib/pgbackrest
+      - /opt/databases/postgresql/spool:/var/spool/pgbackrest
+      - /opt/databases/postgresql/log:/var/log/pgbackrest
+      - /opt/databases/postgresql/conf/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    ports:
+      - "127.0.0.1:${PG_PORT}:5432"
+    networks:
+      - pg-net
+    # Runs tini as PID 1. This is load-bearing, not hygiene, and pairs with
+    # archive-async=y in pgbackrest.conf.template.
+    #
+    # Asynchronous archive-push forks a detached worker whose parent exits, so
+    # the worker is reparented to PID 1. Without tini that is the postmaster,
+    # which in PostgreSQL 18 reaps the unknown child and treats a nonzero exit
+    # as a crashed backend: "untracked child process exited with exit code
+    # 103", then "all server processes terminated; reinitializing". Every
+    # archive failure would drop all client connections and force crash
+    # recovery. With tini as PID 1 the orphan is reaped there and a failing
+    # archive_command is just retried.
+    init: true
+    mem_limit: ${PG_MEM_LIMIT}
+    # Parallel query allocates its shared memory in /dev/shm, which Docker
+    # defaults to 64 MB. Too small a value fails parallel plans at run time.
+    shm_size: 1gb
+    # The image sets STOPSIGNAL SIGINT, which is a fast shutdown. The grace
+    # period gives that shutdown time to finish instead of being SIGKILLed into
+    # a recovery on next start.
+    stop_grace_period: 1m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  pg-net:
+    name: pg-net
+    driver: bridge

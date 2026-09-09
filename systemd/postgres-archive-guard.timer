@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the PostgreSQL WAL archive every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Unit=postgres-archive-guard.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,69 @@
+# Rendered by init.sh into /opt/databases/postgresql/conf/pgbackrest.conf and
+# mounted read-only at /etc/pgbackrest/pgbackrest.conf. Edit this file and
+# re-run init.sh; editing the rendered copy is overwritten on the next run.
+
+[global]
+repo1-path=/var/lib/pgbackrest
+
+# Without repo1-retention-full nothing is ever expired and the repository grows
+# without bound.
+repo1-retention-full=${PGBACKREST_RETENTION_FULL}
+repo1-retention-diff=${PGBACKREST_RETENTION_DIFF}
+
+# Bundling packs small files together, which matters because a PostgreSQL
+# cluster is mostly small relation segments. Block incremental stores only the
+# changed blocks of a large file and requires bundling.
+repo1-bundle=y
+repo1-block=y
+
+# zstd compresses better than the gz default at lower CPU cost.
+compress-type=zst
+compress-level=6
+
+# Half the host's cores, so a backup does not starve the server it is backing up.
+# The value below assumes 8; scale it with `nproc`.
+process-max=4
+
+# Forces an immediate checkpoint instead of waiting up to checkpoint_timeout
+# (15min here) for the next scheduled one.
+start-fast=y
+
+# Compare by checksum rather than timestamp, so a file whose mtime lies is still
+# detected as changed.
+delta=y
+
+# archive-push returns as soon as the segment is spooled and a background
+# process transfers it, which keeps WAL archiving off the critical path of a
+# commit-heavy workload.
+#
+# This requires "init: true" on the container. The detached worker reparents to
+# PID 1, and a postmaster running as PID 1 treats its nonzero exit as a crashed
+# backend and restarts the whole cluster. See the comment in docker-compose.yml.
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+# Backstop, sized far beyond any failure that gets noticed. Once the unarchived
+# queue exceeds this, pgBackRest reports success to PostgreSQL and discards WAL,
+# which bounds pg_wal and keeps the filesystem alive for whatever else shares it,
+# at the cost of a gap in the recovery chain.
+#
+# This is not the primary defence. archive-guard.sh detects a stuck archive
+# within minutes; at 16MB per archive_timeout the queue needs days of unnoticed
+# failure to reach this size. Size it to the free space that can be spent without
+# endangering anything else on the filesystem, and treat it firing as an incident:
+# pgBackRest logs "dropped WAL file", and the next full backup starts a new chain.
+archive-push-queue-max=${PGBACKREST_ARCHIVE_QUEUE_MAX}
+
+log-path=/var/log/pgbackrest
+log-level-console=info
+log-level-file=detail
+
+# repo1-cipher-type is off. The repository sits on the same filesystem as the
+# cluster, so anyone who can read it can already read PGDATA. Set
+# repo1-cipher-type=aes-256-cbc and repo1-cipher-pass before copying backups to
+# anywhere that assumption stops holding.
+
+[main]
+pg1-path=/var/lib/postgresql/18/docker
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql

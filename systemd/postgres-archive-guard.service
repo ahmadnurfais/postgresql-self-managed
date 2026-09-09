@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the PostgreSQL WAL archive, disk headroom and backup freshness
+Documentation=file:///opt/postgresql-self-managed/README.md
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+# Replace with the absolute path to this repository on the server.
+WorkingDirectory=/opt/postgresql-self-managed
+ExecStart=/opt/postgresql-self-managed/archive-guard.sh

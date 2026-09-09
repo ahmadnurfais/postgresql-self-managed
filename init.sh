@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PG_BASE_DIR="/opt/databases/postgresql"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONTAINER="postgres"
+STANZA="main"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: must run as root. It creates $PG_BASE_DIR and chowns it to the postgres container user (999)."
+    exit 1
+fi
+
+if [ ! -f "$SCRIPT_DIR/.env" ]; then
+    echo "Error: .env file not found in $SCRIPT_DIR. Copy .env.example to .env and fill in the values."
+    exit 1
+fi
+
+set -a
+source "$SCRIPT_DIR/.env"
+set +a
+
+# Role and database names are interpolated into SQL as identifiers, which
+# quote_ident cannot help with inside a heredoc. Restricting them to unquoted
+# lower-case identifiers is what makes that interpolation safe.
+for var in PG_APP_USER PG_APP_DB; do
+    if [[ ! ${!var} =~ ^[a-z_][a-z0-9_]*$ ]]; then
+        echo "Error: $var must be a lower-case identifier matching ^[a-z_][a-z0-9_]*$ (got '${!var}')."
+        exit 1
+    fi
+done
+
+# --- Preflight ---------------------------------------------------------------
+# A second PostgreSQL already on this port makes "docker compose up" fail with a
+# message that does not name the culprit, and only after the directories have
+# been created. Check first.
+if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    echo "Container '$CONTAINER' is already running; skipping the port check."
+elif ss -ltnH "sport = :$PG_PORT" 2>/dev/null | grep -q .; then
+    echo "Error: 127.0.0.1:$PG_PORT is already in use."
+    echo "  Another PostgreSQL is probably already published on this port."
+    echo "  Stop it, or set PG_PORT to a free port in .env."
+    ss -ltnp "sport = :$PG_PORT" 2>/dev/null || true
+    exit 1
+fi
+
+# --- Directories -------------------------------------------------------------
+echo "Preparing directories in $PG_BASE_DIR..."
+mkdir -p "$PG_BASE_DIR"/{data,backups,spool,log,conf}
+
+# data/ is not chowned recursively: the entrypoint owns everything under PGDATA
+# and its permissions are load-bearing (PostgreSQL refuses to start on a data
+# directory that is group- or world-accessible).
+chown 999:999 "$PG_BASE_DIR" "$PG_BASE_DIR/data"
+chown -R 999:999 "$PG_BASE_DIR"/{backups,spool,log,conf}
+
+# --- pgBackRest configuration ------------------------------------------------
+# A .env predating these settings would otherwise render an empty value, which
+# pgbackrest rejects, breaking archiving in exactly the silent way this setting
+# exists to bound.
+: "${PGBACKREST_ARCHIVE_QUEUE_MAX:=64GiB}"
+
+echo "Rendering pgbackrest.conf to $PG_BASE_DIR/conf/pgbackrest.conf..."
+sed -e "s|\${PGBACKREST_RETENTION_FULL}|${PGBACKREST_RETENTION_FULL}|g" \
+    -e "s|\${PGBACKREST_RETENTION_DIFF}|${PGBACKREST_RETENTION_DIFF}|g" \
+    -e "s|\${PGBACKREST_ARCHIVE_QUEUE_MAX}|${PGBACKREST_ARCHIVE_QUEUE_MAX}|g" \
+    "$SCRIPT_DIR/pgbackrest.conf.template" \
+    > "$PG_BASE_DIR/conf/pgbackrest.conf"
+chown 999:999 "$PG_BASE_DIR/conf/pgbackrest.conf"
+chmod 640 "$PG_BASE_DIR/conf/pgbackrest.conf"
+
+# --- Start -------------------------------------------------------------------
+echo "Building the image (postgres:18.6-trixie plus pgbackrest)..."
+docker compose -f "$SCRIPT_DIR/docker-compose.yml" build
+
+echo "Starting PostgreSQL..."
+docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d postgres
+
+# Accepting connections on the socket is not enough. On a fresh data directory
+# the entrypoint first runs a temporary server with listen_addresses='' to run
+# initdb and create the superuser, then stops it and starts the real one. That
+# temporary server answers on the Unix socket, so a socket-based check returns
+# during initialisation and the pgbackrest commands below then run against a
+# server that is about to shut down. Checking over TCP separates the two: only
+# the real server listens on the port.
+echo "Waiting for PostgreSQL to accept TCP connections..."
+until docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; do
+    echo "Waiting..."
+    sleep 2
+done
+
+# Every command runs as the postgres user. The image sets no USER, so a bare
+# "docker exec" is root, and pgbackrest run as root writes root-owned files into
+# the repository that archive-push (which runs as postgres) then cannot touch.
+pg_exec() {
+    docker exec -u postgres "$CONTAINER" "$@"
+}
+
+# Passwords reach psql on stdin rather than in arguments, because "docker exec"
+# arguments are visible in host ps. Single quotes in a value are doubled so a
+# password containing one cannot break out of the SQL literal.
+psql_stdin() {
+    docker exec -i -u postgres "$CONTAINER" \
+        psql -v ON_ERROR_STOP=1 --no-psqlrc -d "${1:-postgres}"
+}
+
+sql_literal() {
+    printf "'%s'" "${1//\'/\'\'}"
+}
+
+# --- pgBackRest stanza -------------------------------------------------------
+# archive_mode is on from the first boot, so the WAL written during initdb has
+# nowhere to go until this runs. PostgreSQL retries archive_command
+# indefinitely and keeps the segments, so they are pushed as soon as the stanza
+# exists; the log lines from that window are expected and nothing is lost.
+echo "Creating the pgBackRest stanza '$STANZA' (if not exists)..."
+pg_exec pgbackrest --stanza="$STANZA" stanza-create
+
+echo "Verifying the archive and repository end to end..."
+pg_exec pgbackrest --stanza="$STANZA" check
+
+# --- Roles and databases -----------------------------------------------------
+echo "Setting the superuser password..."
+psql_stdin postgres <<SQL
+ALTER ROLE postgres PASSWORD $(sql_literal "$POSTGRES_PASSWORD");
+SQL
+
+echo "Creating application role '$PG_APP_USER' (if not exists)..."
+psql_stdin postgres <<SQL
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$PG_APP_USER') THEN
+    CREATE ROLE $PG_APP_USER LOGIN PASSWORD $(sql_literal "$PG_APP_PASSWORD");
+    RAISE NOTICE 'Created role $PG_APP_USER.';
+  ELSE
+    ALTER ROLE $PG_APP_USER LOGIN PASSWORD $(sql_literal "$PG_APP_PASSWORD");
+    RAISE NOTICE 'Role $PG_APP_USER already exists; password reset.';
+  END IF;
+END
+\$\$;
+SQL
+
+# CREATE DATABASE cannot run inside a transaction block, so it cannot go in the
+# DO block above. \gexec runs the generated statement only when the SELECT
+# returns a row.
+echo "Creating database '$PG_APP_DB' owned by '$PG_APP_USER' (if not exists)..."
+psql_stdin postgres <<SQL
+SELECT 'CREATE DATABASE $PG_APP_DB OWNER $PG_APP_USER'
+ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$PG_APP_DB')
+\gexec
+SQL
+
+# Ownership is what grants the role the public schema. PostgreSQL 15 revoked
+# CREATE on public from PUBLIC, and public is owned by pg_database_owner, so the
+# database owner gets it and nobody else does.
+psql_stdin postgres <<SQL
+ALTER DATABASE $PG_APP_DB OWNER TO $PG_APP_USER;
+SQL
+
+echo "Enabling pg_stat_statements..."
+for db in postgres "$PG_APP_DB"; do
+    psql_stdin "$db" <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+SQL
+done
+
+# --- Baseline backup ---------------------------------------------------------
+if pg_exec pgbackrest --stanza="$STANZA" info | grep -q 'full backup:'; then
+    echo "Repository already holds a full backup; skipping the baseline."
+else
+    echo "Taking the baseline full backup (this is the only one init.sh takes)..."
+    pg_exec pgbackrest --stanza="$STANZA" backup --type=full
+fi
+
+echo
+echo "PostgreSQL 18 setup complete."
+echo "  Host client:      postgresql://$PG_APP_USER:PASSWORD@127.0.0.1:$PG_PORT/$PG_APP_DB"
+echo "  Container client: postgresql://$PG_APP_USER:PASSWORD@postgres:5432/$PG_APP_DB  (join pg-net)"
+echo
+echo "Install the backup timers next; see the Backups section of README.md."

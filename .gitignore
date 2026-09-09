@@ -1,0 +1,7 @@
+.env
+pgbackrest.conf
+data/
+backups/
+spool/
+*.log
+*.dump
