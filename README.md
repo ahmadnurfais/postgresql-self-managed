@@ -21,6 +21,7 @@ than a sidecar container because `archive_command` is executed by the `postgres`
 | `/opt/databases/postgresql/conf/pgbackrest.conf` | Rendered from `pgbackrest.conf.template` by `init.sh` |
 | `./postgresql.conf` | Server configuration, mounted read-only into the container |
 | `/opt/databases/postgresql/conf/pg_hba.conf` | Authentication policy rendered from `pg_hba.conf.template` |
+| `/opt/databases/postgresql/conf/auth.conf` | Generated client CA and CRL settings, included by `postgresql.conf` |
 | `PG_TLS_DIR` | Externally provisioned TLS directory, mounted read-only at `/etc/postgresql/tls` |
 
 PostgreSQL 18 changed the image's data directory to `/var/lib/postgresql/18/docker` and moved the
@@ -38,7 +39,7 @@ remapping and image UID/GID `999:999`.
 
 ```sh
 cp .env.example .env
-nano .env          # set credentials, PG_TLS_DIR, PG_BIND_ADDRESS, PG_APP_ALLOWED_CIDR
+nano .env          # set mode, credentials, TLS directory, bind address, allowed CIDRs
 sudo ./init.sh
 ```
 
@@ -50,8 +51,8 @@ Recovering means `docker compose down`, `rm -rf` that directory as root, then `i
 
 `init.sh` requires root: it creates `/opt/databases/postgresql` and chowns it to uid 999, the
 postgres container user. It is idempotent. Re-running it against a live instance renders the
-pgBackRest config again, resets both passwords to whatever `.env` currently holds, reports what
-already exists, and skips the baseline backup.
+configuration again, resets the superuser password, and applies application credentials
+for the selected mode. It reports existing objects and skips the baseline backup.
 
 What it does:
 
@@ -101,7 +102,7 @@ holding the config file and refuses to start.
 
 `init.sh` renders `pg_hba.conf.template` to the host configuration directory. PostgreSQL
 uses its read-only mount at `/etc/postgresql/pg_hba.conf`. The active rules permit local
-`peer` administration, reject plaintext TCP, and permit TLS/SCRAM access for `PG_APP_USER`
+`peer` administration, reject plaintext TCP, and permit the selected TLS authentication for `PG_APP_USER`
 to `PG_APP_DB` from `PG_APP_ALLOWED_CIDR`. Unmatched connections are rejected.
 
 `PG_APP_ALLOWED_CIDR` accepts one explicit IPv4 or IPv6 network, or a quoted,
@@ -117,7 +118,7 @@ PG_APP_ALLOWED_CIDR=192.0.2.10/32
 Names in the HBA rule are quoted to prevent interpretation as special HBA keywords.
 Re-running `init.sh` renders and reloads the policy from `.env` and the template,
 overwriting manual edits to `/opt/databases/postgresql/conf/pg_hba.conf`.
-It also builds the image and resets passwords as described in Setup.
+It also builds the image and applies credentials as described in Setup.
 
 For temporary testing, edit the host-mounted authentication file, check
 `pg_hba_file_rules` for errors, and run `SELECT pg_reload_conf();` through the local
@@ -131,6 +132,49 @@ authentication or TLS validation. Use the connection checks below for that purpo
 `postgresql.auto.conf` in `PGDATA` is read after `postgresql.conf`, so `ALTER SYSTEM` still works
 and still wins. A setting that appears not to take effect after a restart is usually one that
 `ALTER SYSTEM` set at some point; `ALTER SYSTEM ... RESET` clears it.
+
+### Authentication modes
+
+`PG_AUTH_MODE` accepts `tls` or `mtls`. An omitted setting defaults to `tls`;
+an empty or unknown value fails initialization. Both modes require server TLS and
+restrict application access to `PG_APP_ALLOWED_CIDR`.
+
+| Mode | HBA method | Application credential | Required server files under `PG_TLS_DIR` |
+| --- | --- | --- | --- |
+| `tls` | `scram-sha-256` | `PG_APP_PASSWORD` | `fullchain.pem`, `privkey.pem` |
+| `mtls` | `cert` | Client certificate with CN equal to `PG_APP_USER`, and its private key | Server files plus `client-ca.pem` |
+
+`init.sh` requires an application password in `tls` mode. In `mtls` mode it ignores
+`PG_APP_PASSWORD` and sets the role's password to `NULL`. The application still supplies
+a username and receives that role's permissions. `POSTGRES_PASSWORD` remains required
+in both modes for the image's superuser initialization and administrative credential setup.
+
+`init.sh` renders `/opt/databases/postgresql/conf/auth.conf` with `ssl_ca_file` and
+`ssl_crl_file`. In `tls` mode both are empty. In `mtls` mode `ssl_ca_file` points to
+`/etc/postgresql/tls/client-ca.pem`. Keep these settings out of `ALTER SYSTEM` overrides.
+
+Optional client revocation checking:
+
+```dotenv
+PG_AUTH_MODE=mtls
+PG_CLIENT_CRL_FILE=client-ca.crl.pem
+```
+
+`PG_CLIENT_CRL_FILE` is a filename inside `PG_TLS_DIR`, not an absolute path. It accepts
+letters, digits, dots, underscores, and hyphens, starting with a letter or digit.
+A nonempty value requires `mtls` mode and an existing readable PEM CRL file.
+An empty value disables CRL checking; certificate trust, identity, and expiry checks remain.
+
+To switch modes, prepare the external prerequisites, edit `.env`, and run `sudo ./init.sh`.
+Returning to `tls` requires a nonempty `PG_APP_PASSWORD` and an empty `PG_CLIENT_CRL_FILE`.
+The script clears client trust settings in `tls` mode and regenerates the HBA rules.
+The role and database retain their ownership and data.
+
+Authentication and trust settings support reload. A deployment update that adds mounts,
+changes the image, or changes the published port can recreate the container and interrupt
+connections. Existing sessions otherwise remain authenticated until disconnected; use fresh
+connections or recycle application pools to verify a mode change. Removing a password or
+revoking a certificate does not terminate existing sessions.
 
 ### Collation
 
@@ -186,6 +230,12 @@ does not proxy PostgreSQL on port 5432. PostgreSQL handles TLS itself.
 
 ```sh
 psql "host=db.example.com port=5432 dbname=app_db user=app_user sslmode=verify-full sslrootcert=/path/to/ca-bundle.pem" -W
+```
+
+The command above uses `tls` mode. For passwordless `mtls`:
+
+```sh
+psql "host=db.example.com port=5432 dbname=app_db user=app_user sslmode=verify-full sslrootcert=/path/to/server-ca-bundle.pem sslcert=/path/to/client.crt sslkey=/path/to/client.key" -w
 ```
 
 The CA bundle must trust the server certificate issuer. It is a client-side file,
@@ -258,7 +308,8 @@ resolve Docker network aliases. The HBA allow rule must cover its observed sourc
 
 ### ASP.NET Core / Npgsql
 
-Supply the connection string through deployment secrets or ASP.NET Core configuration:
+Supply the connection string through deployment secrets or ASP.NET Core configuration.
+For `tls` mode (also used in the Compose examples above):
 
 ```text
 Host=db.example.com;Port=5432;Database=app_db;Username=app_user;Password=<secret>;SSL Mode=VerifyFull
@@ -266,8 +317,21 @@ Host=db.example.com;Port=5432;Database=app_db;Username=app_user;Password=<secret
 
 `VerifyFull` requires TLS, validates certificate trust, and checks the hostname.
 For a private CA absent from the backend OS trust store, append
-`Root Certificate=/app/certs/database-ca.pem`. The backend needs no client certificate.
+`Root Certificate=/app/certs/database-ca.pem`. In `tls` mode the backend needs no client certificate.
 `Prefer`, `Require`, and certificate-validation bypasses do not provide this verification.
+
+For passwordless `mtls` with Npgsql 6 or later and PEM credentials:
+
+```text
+Host=db.example.com;Port=5432;Database=app_db;Username=app_user;SSL Mode=VerifyFull;SSL Certificate=/app/certs/client.crt;SSL Key=/app/certs/client.key
+```
+
+The certificate CN must match `Username`. The paths must be accessible in the backend's
+runtime environment; containerized backends mount the files into their own containers.
+Protect the client key and limit access to the application identity. An encrypted client
+key additionally requires `SSL Password`, which is a key passphrase, not a database password.
+`Root Certificate` trusts the server issuer; `client-ca.pem` on PostgreSQL trusts client
+issuers. The two trust chains can use different CAs.
 
 ### Verify application connections
 
@@ -283,6 +347,19 @@ untrusted CA fails, and that a mismatched `host` with `hostaddr` set to the same
 IP fails hostname verification. A connection from a denied source must fail even with
 valid credentials and TLS. In Npgsql, repeat the valid connection and rejection checks
 with `SSL Mode=VerifyFull` and `SSL Mode=Disable`.
+
+In `mtls` mode, a valid client certificate and matching role must connect without a
+database password. Repeat with no client certificate, an untrusted client certificate,
+and a trusted certificate with a different CN: each must fail. Supplying a database
+password must not bypass certificate authentication. With CRL checking enabled, a revoked
+certificate must fail while a non-revoked certificate from the same CA still succeeds.
+
+Inspect the client identity on the application's connection:
+
+```sql
+SELECT ssl, version, client_dn, client_serial, issuer_dn
+FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+```
 
 Inspect the active HBA configuration through the local administrative socket:
 
@@ -308,6 +385,32 @@ The host administrator provisions `PG_TLS_DIR` before `init.sh` runs:
 Its SAN must cover the connection hostname. Use an approved public or private CA.
 Public ACME certificates can use DNS-01 validation without opening database or HTTP ports.
 Certificate issuance and deployment are external to this repository.
+
+### Additional mTLS prerequisites
+
+Before `init.sh` runs in `mtls` mode, the administrator supplies:
+
+| Location | Files and requirements |
+| --- | --- |
+| Database TLS directory | `client-ca.pem`: trusted client CA certificate or PEM CA bundle; no private signing key |
+| Database TLS directory, if CRL checking is enabled | The PEM CRL bundle named by `PG_CLIENT_CRL_FILE`, with valid issuer signatures and unexpired CRLs for the client chain |
+| Each backend | Its own client certificate and private key; certificate CN equal to `PG_APP_USER`, `CA:FALSE`, and TLS client-authentication usage |
+| CA administration environment | Protected CA signing keys, issuance/revocation records, and backups |
+
+The PostgreSQL user must be able to read the CA and CRL files; root ownership with mode
+`0644` is suitable for these public files. Backend keys remain on the backend. CA signing
+keys remain outside database and backend deployments. With intermediate client CAs, the
+client presents its intermediate chain after the leaf certificate and PostgreSQL trusts
+the appropriate root CA. Inspect certificates, chain validity, and matching client keys
+before deployment. The init preflight checks readability and basic CA/CRL parsing; successful
+fresh client connections prove the complete configuration.
+
+An external private CA, organizational PKI, or managed issuance service can provision client
+credentials. No CA service, certificate-generation command, or provider-specific account is
+required by this repository. DNS resolution and a trusted server certificate must already
+exist, independent of how the deployment obtains them.
+
+### Permissions and renewal
 
 Confirm the image identity before assigning file ownership:
 
@@ -347,6 +450,19 @@ PostgreSQL retains its previous TLS configuration if reloading invalid files fai
 `pg_reload_conf()` only confirms the reload signal. Check logs and a new TLS connection
 to confirm the renewed certificate is served. Monitor the served certificate's expiry.
 Certbot's renewal dry-run alone does not prove deployment hooks work.
+
+Client certificate renewal uses the deployment's client CA, independently of server
+certificate renewal. Deploy the replacement client certificate and key to the backend,
+then open new connections with the new credentials. Some application runtimes require
+recreating their data source or restarting the application to load replacement credentials.
+
+For revocation, revoke the certificate in the issuing CA, generate a new CRL, deploy it
+under the configured filename, and reload PostgreSQL. PostgreSQL reads the local CRL;
+it does not fetch updates from the CA. Refresh CRLs before `nextUpdate`, even when no
+certificates have been revoked. An expired CRL can reject otherwise valid client connections.
+For a CA hierarchy, supply the required CRLs for the chain. Verify both revoked-client
+rejection and non-revoked-client success on new connections. Plan CA rotation with a trust
+overlap and remove the old CA after its client certificates have been replaced.
 
 ### Percent-encode credentials
 

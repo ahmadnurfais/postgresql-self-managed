@@ -37,6 +37,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: /opt/databases/postgresql/conf/auth.conf
+        target: /etc/postgresql/auth.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ${PG_TLS_DIR:?Set PG_TLS_DIR to the prepared TLS directory}
         target: /etc/postgresql/tls
         read_only: true

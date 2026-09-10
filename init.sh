@@ -31,7 +31,23 @@ for var in PG_APP_USER PG_APP_DB; do
 done
 
 # --- Preflight ---------------------------------------------------------------
-for var in PG_TLS_DIR PG_BIND_ADDRESS PG_APP_ALLOWED_CIDR PG_PORT POSTGRES_PASSWORD PG_APP_PASSWORD; do
+export PG_AUTH_MODE="${PG_AUTH_MODE-tls}"
+export PG_CLIENT_CRL_FILE="${PG_CLIENT_CRL_FILE-}"
+case "$PG_AUTH_MODE" in
+    tls|mtls) ;;
+    *) echo "Error: PG_AUTH_MODE must be tls or mtls."; exit 1 ;;
+esac
+if [ "$PG_AUTH_MODE" = tls ] && [ -z "${PG_APP_PASSWORD:-}" ]; then
+    echo "Error: PG_APP_PASSWORD is required in tls mode."
+    exit 1
+fi
+if [ -n "$PG_CLIENT_CRL_FILE" ]; then
+    if [ "$PG_AUTH_MODE" != mtls ] || [[ ! "$PG_CLIENT_CRL_FILE" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+        echo "Error: PG_CLIENT_CRL_FILE requires mtls mode and a filename inside PG_TLS_DIR."
+        exit 1
+    fi
+fi
+for var in PG_TLS_DIR PG_BIND_ADDRESS PG_APP_ALLOWED_CIDR PG_PORT POSTGRES_PASSWORD; do
     if [ -z "${!var:-}" ]; then
         echo "Error: $var must be set in .env."
         exit 1
@@ -43,6 +59,14 @@ if [ "$PG_APP_USER" = postgres ]; then
 fi
 if [[ "$PG_TLS_DIR" != /* ]] || [ ! -f "$PG_TLS_DIR/fullchain.pem" ] || [ ! -f "$PG_TLS_DIR/privkey.pem" ]; then
     echo "Error: PG_TLS_DIR must be an absolute directory containing fullchain.pem and privkey.pem."
+    exit 1
+fi
+if [ "$PG_AUTH_MODE" = mtls ] && [ ! -f "$PG_TLS_DIR/client-ca.pem" ]; then
+    echo "Error: mtls mode requires PG_TLS_DIR/client-ca.pem."
+    exit 1
+fi
+if [ -n "$PG_CLIENT_CRL_FILE" ] && [ ! -f "$PG_TLS_DIR/$PG_CLIENT_CRL_FILE" ]; then
+    echo "Error: the configured client CRL file does not exist in PG_TLS_DIR."
     exit 1
 fi
 command -v python3 >/dev/null || { echo "Error: python3 is required for IP/CIDR validation."; exit 1; }
@@ -84,10 +108,19 @@ fi
 echo "Building the image (postgres:18.6-trixie plus pgbackrest)..."
 docker compose -f "$SCRIPT_DIR/docker-compose.yml" build
 docker run --rm --user postgres --entrypoint sh \
+    -e PG_AUTH_MODE -e PG_CLIENT_CRL_FILE \
     --mount "type=bind,src=$PG_TLS_DIR,dst=/tls,readonly" \
     postgres-pgbackrest:18.6 \
-    -c 'test -r /tls/fullchain.pem && test -r /tls/privkey.pem' || {
-    echo "Error: the container postgres user cannot read the TLS files."
+    -c 'set -e
+        test -r /tls/fullchain.pem
+        test -r /tls/privkey.pem
+        if [ "$PG_AUTH_MODE" = mtls ]; then
+            openssl x509 -in /tls/client-ca.pem -noout -checkend 0
+        fi
+        if [ -n "$PG_CLIENT_CRL_FILE" ]; then
+            openssl crl -in "/tls/$PG_CLIENT_CRL_FILE" -noout
+        fi' || {
+    echo "Error: required TLS files are unreadable or client trust files are invalid."
     exit 1
 }
 
@@ -126,6 +159,8 @@ import sys
 template = Path(sys.argv[1]).read_text()
 template = template.replace('${PG_APP_DB}', os.environ['PG_APP_DB'])
 template = template.replace('${PG_APP_USER}', os.environ['PG_APP_USER'])
+method = 'cert' if os.environ['PG_AUTH_MODE'] == 'mtls' else 'scram-sha-256'
+template = template.replace('${PG_APP_AUTH_METHOD}', method)
 for line in template.splitlines(keepends=True):
     if '${PG_APP_ALLOWED_CIDR}' in line:
         for cidr in os.environ['PG_APP_ALLOWED_CIDR'].split():
@@ -135,6 +170,20 @@ for line in template.splitlines(keepends=True):
 PY
 chown 999:999 "$PG_BASE_DIR/conf/pg_hba.conf"
 chmod 640 "$PG_BASE_DIR/conf/pg_hba.conf"
+
+# Explicit empty values clear client trust when switching back to tls mode.
+ca_file=''
+crl_file=''
+if [ "$PG_AUTH_MODE" = mtls ]; then
+    ca_file='/etc/postgresql/tls/client-ca.pem'
+    if [ -n "$PG_CLIENT_CRL_FILE" ]; then
+        crl_file="/etc/postgresql/tls/$PG_CLIENT_CRL_FILE"
+    fi
+fi
+printf "ssl_ca_file = '%s'\nssl_crl_file = '%s'\n" "$ca_file" "$crl_file" \
+    > "$PG_BASE_DIR/conf/auth.conf"
+chown 999:999 "$PG_BASE_DIR/conf/auth.conf"
+chmod 640 "$PG_BASE_DIR/conf/auth.conf"
 
 # --- Start -------------------------------------------------------------------
 echo "Starting PostgreSQL..."
@@ -201,15 +250,19 @@ ALTER ROLE postgres PASSWORD $(sql_literal "$POSTGRES_PASSWORD");
 SQL
 
 echo "Creating application role '$PG_APP_USER' (if not exists)..."
+app_password_sql=NULL
+if [ "$PG_AUTH_MODE" = tls ]; then
+    app_password_sql=$(sql_literal "$PG_APP_PASSWORD")
+fi
 psql_stdin postgres <<SQL
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$PG_APP_USER') THEN
-    CREATE ROLE $PG_APP_USER LOGIN PASSWORD $(sql_literal "$PG_APP_PASSWORD");
+    CREATE ROLE $PG_APP_USER LOGIN PASSWORD $app_password_sql;
     RAISE NOTICE 'Created role $PG_APP_USER.';
   ELSE
-    ALTER ROLE $PG_APP_USER LOGIN PASSWORD $(sql_literal "$PG_APP_PASSWORD");
-    RAISE NOTICE 'Role $PG_APP_USER already exists; password reset.';
+    ALTER ROLE $PG_APP_USER LOGIN PASSWORD $app_password_sql;
+    RAISE NOTICE 'Role $PG_APP_USER already exists; authentication credentials applied.';
   END IF;
 END
 \$\$;
@@ -251,5 +304,6 @@ echo
 echo "PostgreSQL 18 setup complete."
 echo "  Connect using the DNS hostname in the certificate SAN and sslmode=verify-full."
 echo "  Database: $PG_APP_DB; user: $PG_APP_USER; published port: $PG_PORT"
+echo "  Authentication mode: $PG_AUTH_MODE"
 echo
 echo "Install the backup timers next; see the Backups section of README.md."
