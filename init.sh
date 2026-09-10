@@ -31,18 +31,62 @@ for var in PG_APP_USER PG_APP_DB; do
 done
 
 # --- Preflight ---------------------------------------------------------------
+for var in PG_TLS_DIR PG_BIND_ADDRESS PG_APP_ALLOWED_CIDR PG_PORT POSTGRES_PASSWORD PG_APP_PASSWORD; do
+    if [ -z "${!var:-}" ]; then
+        echo "Error: $var must be set in .env."
+        exit 1
+    fi
+done
+if [ "$PG_APP_USER" = postgres ]; then
+    echo "Error: PG_APP_USER must not be the postgres superuser."
+    exit 1
+fi
+if [[ "$PG_TLS_DIR" != /* ]] || [ ! -f "$PG_TLS_DIR/fullchain.pem" ] || [ ! -f "$PG_TLS_DIR/privkey.pem" ]; then
+    echo "Error: PG_TLS_DIR must be an absolute directory containing fullchain.pem and privkey.pem."
+    exit 1
+fi
+command -v python3 >/dev/null || { echo "Error: python3 is required for IP/CIDR validation."; exit 1; }
+python3 - <<'PY'
+import ipaddress
+import os
+import re
+import sys
+
+try:
+    ipaddress.IPv4Address(os.environ['PG_BIND_ADDRESS'])
+    cidr = os.environ['PG_APP_ALLOWED_CIDR']
+    if not re.fullmatch(r'[0-9a-fA-F:.]+/[0-9]+', cidr) or ipaddress.ip_network(cidr).prefixlen == 0:
+        raise ValueError('PG_APP_ALLOWED_CIDR must be an explicit, restricted network CIDR')
+    port = os.environ['PG_PORT']
+    if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError('PG_PORT must be between 1 and 65535')
+except ValueError as error:
+    sys.exit(f'Error: {error}')
+PY
+
 # A second PostgreSQL already on this port makes "docker compose up" fail with a
 # message that does not name the culprit, and only after the directories have
 # been created. Check first.
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     echo "Container '$CONTAINER' is already running; skipping the port check."
 elif ss -ltnH "sport = :$PG_PORT" 2>/dev/null | grep -q .; then
-    echo "Error: 127.0.0.1:$PG_PORT is already in use."
+    echo "Error: port $PG_PORT is already in use."
     echo "  Another PostgreSQL is probably already published on this port."
     echo "  Stop it, or set PG_PORT to a free port in .env."
     ss -ltnp "sport = :$PG_PORT" 2>/dev/null || true
     exit 1
 fi
+
+# Build before checking access as the actual image user. No database is started.
+echo "Building the image (postgres:18.6-trixie plus pgbackrest)..."
+docker compose -f "$SCRIPT_DIR/docker-compose.yml" build
+docker run --rm --user postgres --entrypoint sh \
+    --mount "type=bind,src=$PG_TLS_DIR,dst=/tls,readonly" \
+    postgres-pgbackrest:18.6 \
+    -c 'test -r /tls/fullchain.pem && test -r /tls/privkey.pem' || {
+    echo "Error: the container postgres user cannot read the TLS files."
+    exit 1
+}
 
 # --- Directories -------------------------------------------------------------
 echo "Preparing directories in $PG_BASE_DIR..."
@@ -69,10 +113,16 @@ sed -e "s|\${PGBACKREST_RETENTION_FULL}|${PGBACKREST_RETENTION_FULL}|g" \
 chown 999:999 "$PG_BASE_DIR/conf/pgbackrest.conf"
 chmod 640 "$PG_BASE_DIR/conf/pgbackrest.conf"
 
-# --- Start -------------------------------------------------------------------
-echo "Building the image (postgres:18.6-trixie plus pgbackrest)..."
-docker compose -f "$SCRIPT_DIR/docker-compose.yml" build
+# Write in place so an existing file bind mount sees the new content.
+echo "Rendering pg_hba.conf..."
+sed -e "s|\${PG_APP_DB}|${PG_APP_DB}|g" \
+    -e "s|\${PG_APP_USER}|${PG_APP_USER}|g" \
+    -e "s|\${PG_APP_ALLOWED_CIDR}|${PG_APP_ALLOWED_CIDR}|g" \
+    "$SCRIPT_DIR/pg_hba.conf.template" > "$PG_BASE_DIR/conf/pg_hba.conf"
+chown 999:999 "$PG_BASE_DIR/conf/pg_hba.conf"
+chmod 640 "$PG_BASE_DIR/conf/pg_hba.conf"
 
+# --- Start -------------------------------------------------------------------
 echo "Starting PostgreSQL..."
 docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d postgres
 
@@ -84,7 +134,13 @@ docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d postgres
 # server that is about to shut down. Checking over TCP separates the two: only
 # the real server listens on the port.
 echo "Waiting for PostgreSQL to accept TCP connections..."
+attempts=0
 until docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 60 ]; then
+        echo "Error: PostgreSQL did not become ready within 120 seconds. Check docker compose logs postgres."
+        exit 1
+    fi
     echo "Waiting..."
     sleep 2
 done
@@ -107,6 +163,11 @@ psql_stdin() {
 sql_literal() {
     printf "'%s'" "${1//\'/\'\'}"
 }
+
+# Apply the rendered HBA policy when up -d reuses an existing container.
+psql_stdin postgres <<'SQL'
+SELECT pg_reload_conf();
+SQL
 
 # --- pgBackRest stanza -------------------------------------------------------
 # archive_mode is on from the first boot, so the WAL written during initdb has
@@ -174,7 +235,7 @@ fi
 
 echo
 echo "PostgreSQL 18 setup complete."
-echo "  Host client:      postgresql://$PG_APP_USER:PASSWORD@127.0.0.1:$PG_PORT/$PG_APP_DB"
-echo "  Container client: postgresql://$PG_APP_USER:PASSWORD@postgres:5432/$PG_APP_DB  (join pg-net)"
+echo "  Connect using the DNS hostname in the certificate SAN and sslmode=verify-full."
+echo "  Database: $PG_APP_DB; user: $PG_APP_USER; published port: $PG_PORT"
 echo
 echo "Install the backup timers next; see the Backups section of README.md."

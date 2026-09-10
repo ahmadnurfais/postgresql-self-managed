@@ -18,6 +18,8 @@ services:
       # provider sorts by code point, needs no external library, and is immune to
       # the glibc collation changes that silently invalidate text indexes.
       POSTGRES_INITDB_ARGS: >-
+        --auth-local=peer
+        --auth-host=scram-sha-256
         --locale-provider=builtin
         --builtin-locale=C.UTF-8
         --encoding=UTF8
@@ -28,8 +30,20 @@ services:
       - /opt/databases/postgresql/log:/var/log/pgbackrest
       - /opt/databases/postgresql/conf/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
       - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - type: bind
+        source: /opt/databases/postgresql/conf/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PG_TLS_DIR:?Set PG_TLS_DIR to the prepared TLS directory}
+        target: /etc/postgresql/tls
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
-      - "127.0.0.1:${PG_PORT}:5432"
+      - "${PG_BIND_ADDRESS:?Set PG_BIND_ADDRESS}:${PG_PORT}:5432"
     networks:
       - pg-net
     # Runs tini as PID 1. This is load-bearing, not hygiene, and pairs with

@@ -1,0 +1,13 @@
+# Local administration and pgBackRest use the postgres operating-system user.
+local       all             postgres                                peer
+
+# Reject plaintext TCP, including replication connections.
+hostnossl   all             all             0.0.0.0/0               reject
+hostnossl   all             all             ::/0                    reject
+hostnossl   replication     all             0.0.0.0/0               reject
+hostnossl   replication     all             ::/0                    reject
+
+# Quoted names are literal database and role names, not HBA keywords.
+hostssl     "${PG_APP_DB}"  "${PG_APP_USER}"  ${PG_APP_ALLOWED_CIDR}   scram-sha-256
+
+# Connections without a matching allow rule are rejected.

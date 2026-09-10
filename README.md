@@ -20,6 +20,8 @@ than a sidecar container because `archive_command` is executed by the `postgres`
 | `/opt/databases/postgresql/log` | pgBackRest logs |
 | `/opt/databases/postgresql/conf/pgbackrest.conf` | Rendered from `pgbackrest.conf.template` by `init.sh` |
 | `./postgresql.conf` | Server configuration, mounted read-only into the container |
+| `/opt/databases/postgresql/conf/pg_hba.conf` | Authentication policy rendered from `pg_hba.conf.template` |
+| `PG_TLS_DIR` | Externally provisioned TLS directory, mounted read-only at `/etc/postgresql/tls` |
 
 PostgreSQL 18 changed the image's data directory to `/var/lib/postgresql/18/docker` and moved the
 declared volume from `/var/lib/postgresql/data` to `/var/lib/postgresql`, so that `pg_upgrade
@@ -29,9 +31,14 @@ disappears with the container.
 
 ## Setup
 
+Requirements: Docker Engine with Compose v2, Bash, Python 3 for address validation,
+and externally provisioned TLS files as described in **TLS files and renewal**.
+The host directory ownership in `init.sh` assumes rootful Docker without user-namespace
+remapping and image UID/GID `999:999`.
+
 ```sh
 cp .env.example .env
-nano .env          # set POSTGRES_PASSWORD and PG_APP_PASSWORD
+nano .env          # set credentials, PG_TLS_DIR, PG_BIND_ADDRESS, PG_APP_ALLOWED_CIDR
 sudo ./init.sh
 ```
 
@@ -48,9 +55,9 @@ already exists, and skips the baseline backup.
 
 What it does:
 
-1. Refuses to start if `PG_PORT` is already bound, before creating any directories.
-2. Renders `pgbackrest.conf.template` into `/opt/databases/postgresql/conf/pgbackrest.conf`.
-3. Builds the image and starts the container.
+1. Validates required settings, IP addresses, CIDR, port, and TLS file presence; checks port availability.
+2. Builds the image and checks TLS file readability as its PostgreSQL user.
+3. Prepares directories, renders pgBackRest and authentication configuration, and starts the container.
 4. Creates the pgBackRest stanza and runs `pgbackrest check`, which proves the archive works
    end to end rather than merely that the config parses.
 5. Creates the application role, and the application database with that role as `OWNER`.
@@ -73,15 +80,10 @@ Ownership of the database is what grants the application role the `public` schem
 revoked `CREATE` on `public` from `PUBLIC` and made the schema owned by `pg_database_owner`, so
 the database owner has it and no other role does.
 
-There is no separate backup role. pgBackRest connects over the Unix socket as the postgres
-operating-system user, which the `local all all trust` line that `initdb` writes accepts. `psql`
-run through `docker exec` reaches the server the same way, which is why none of the maintenance
-commands in this file pass a password.
-
-The trust is confined to the container. Tightening it anyway means adding `--auth-local=peer` and
-`--auth-host=scram-sha-256` to `POSTGRES_INITDB_ARGS` on a fresh cluster. `peer` works only while
-`POSTGRES_USER` stays `postgres`, because it maps the operating-system user to a database role of
-the same name, and the entrypoint runs its own setup over that socket.
+pgBackRest and administrative `psql` commands connect over the Unix socket using
+`local all postgres peer`. Commands must run as the `postgres` operating-system user:
+`docker exec -u postgres postgres psql -d postgres`. `POSTGRES_USER` stays `postgres`
+so the image entrypoint can initialize the database through the same rule.
 
 ## Configuration
 
@@ -97,22 +99,18 @@ A config file outside the data directory has to name `data_directory`, `hba_file
 `ident_file` explicitly. Without `hba_file`, PostgreSQL looks for `pg_hba.conf` in the directory
 holding the config file and refuses to start.
 
-`pg_hba.conf` stays under the entrypoint's control. It appends one line,
-`host all all all scram-sha-256`, after the `initdb` defaults. The full result:
+`init.sh` renders `pg_hba.conf.template` to the host configuration directory. PostgreSQL
+uses its read-only mount at `/etc/postgresql/pg_hba.conf`. The active rules permit local
+`peer` administration, reject plaintext TCP, and permit TLS/SCRAM access for `PG_APP_USER`
+to `PG_APP_DB` from `PG_APP_ALLOWED_CIDR`. Unmatched connections are rejected.
 
-```text
-local   all   all                     trust
-host    all   all   127.0.0.1/32      trust
-host    all   all   ::1/128           trust
-host    all   all   all               scram-sha-256
-```
+`PG_APP_ALLOWED_CIDR` accepts one explicit IPv4 or IPv6 network. `/0` is rejected.
+Names in the HBA rule are quoted to prevent interpretation as special HBA keywords.
+Additional source networks require explicit template rules. Re-running `init.sh`
+renders and reloads the policy; it also resets passwords as described in Setup.
 
-`pg_hba.conf` is first match wins, so the appended line governs every address except the
-container's own loopback. Those three `trust` lines match only connections originating inside the
-container's network namespace, which already requires root or uid 999 in the container. Nothing
-outside can present `127.0.0.1` or the Unix socket as its source: a client on `pg-net` arrives as
-`172.x`, and a client on the host arrives through the published port as the bridge gateway. Both
-are matched by the `scram-sha-256` line and both are refused without the password.
+The TCP healthcheck uses `pg_isready` to check server readiness. It does not prove
+authentication or TLS validation. Use the connection checks below for that purpose.
 
 `postgresql.auto.conf` in `PGDATA` is read after `postgresql.conf`, so `ALTER SYSTEM` still works
 and still wins. A setting that appears not to take effect after a restart is usually one that
@@ -152,15 +150,30 @@ builtin provider.
 
 ## Connecting
 
-The port is published on `127.0.0.1` only. Remote access goes through an SSH tunnel or a reverse
-proxy, not by widening the binding. Because the only paths to the server are host loopback and a
-private bridge network, `ssl` is off.
+`PG_BIND_ADDRESS` selects the host IPv4 interface for the published `PG_PORT`.
+The default `127.0.0.1` permits host-local access. Remote deployments set an address
+assigned to the host, or `0.0.0.0` with ingress restricted to approved sources.
+The database DNS hostname must resolve to a reachable endpoint and match the server
+certificate SAN. Examples use `db.example.com`; each deployment supplies its own name.
 
-From the host:
+Set `PG_APP_ALLOWED_CIDR` to the backend source as PostgreSQL sees it. A backend behind
+NAT normally arrives from its public egress IP. Host-local published-port connections
+can arrive from the Docker bridge gateway. Container clients arrive from their bridge
+addresses. Confirm the source in the deployed network before choosing the allow rule.
+
+Restrict the published port at the provider firewall and Docker-aware host firewall.
+Docker-published traffic can bypass ordinary UFW rules. Verify access from both an
+allowed and a denied source; a UFW status listing alone is insufficient.
+
+For Cloudflare DNS, use **DNS only** for the database record. The standard HTTP proxy
+does not proxy PostgreSQL on port 5432. PostgreSQL handles TLS itself.
 
 ```sh
-psql "postgresql://app_user:PASSWORD@127.0.0.1:5432/app_db"
+psql "host=db.example.com port=5432 dbname=app_db user=app_user sslmode=verify-full sslrootcert=/path/to/ca-bundle.pem" -W
 ```
+
+The CA bundle must trust the server certificate issuer. It is a client-side file,
+not the server private key. `psql` trust configuration differs from Npgsql's OS trust store.
 
 ### From another compose project on the same host
 
@@ -171,7 +184,7 @@ services:
   my-app:
     image: my-app:latest
     environment:
-      DATABASE_URL: postgresql://app_user:PASSWORD@postgres:5432/app_db
+      ConnectionStrings__DefaultConnection: "Host=db.example.com;Port=5432;Database=app_db;Username=app_user;Password=<secret>;SSL Mode=VerifyFull"
     networks:
       - pg-net
 
@@ -184,12 +197,24 @@ networks:
 stack first; a project that comes up before `pg-net` exists fails rather than quietly building a
 network of its own.
 
-Container to container traffic crosses the bridge, so the published port plays no part and does
-not need widening. A container on the default bridge cannot reach PostgreSQL at all, because the
-port is published on loopback. Joining `pg-net` is what grants access.
+Container traffic on `pg-net` uses port 5432 without the host port mapping. Configure a
+network alias matching the certificate SAN on the database service, for example in a
+deployment-specific Compose override:
+
+```yaml
+services:
+  postgres:
+    networks:
+      pg-net:
+        aliases:
+          - db.example.com
+```
+
+The application must resolve that alias and its source must match the HBA allow rule.
+The network itself does not provide TLS or database authorization.
 
 ```sh
-docker exec my-app getent hosts postgres
+docker exec my-app getent hosts db.example.com
 docker inspect -f '{{json .NetworkSettings.Networks}}' my-app | jq keys
 ```
 
@@ -198,8 +223,9 @@ exit means the container is not on `pg-net`, and `jq keys` then shows which netw
 
 ### From a container using `network_mode: host`
 
-A host-network container shares the host's network namespace and reaches PostgreSQL on the
-published port, exactly as a host client does:
+A host-network container shares the host network namespace and uses the published
+port. Configure DNS or a host entry so the certificate hostname resolves to the intended
+host interface:
 
 ```yaml
 services:
@@ -207,12 +233,104 @@ services:
     image: my-api:latest
     network_mode: host
     environment:
-      DATABASE_URL: postgresql://app_user:PASSWORD@127.0.0.1:5432/app_db
+      ConnectionStrings__DefaultConnection: "Host=db.example.com;Port=5432;Database=app_db;Username=app_user;Password=<secret>;SSL Mode=VerifyFull"
 ```
 
 No `networks:` block. The two are mutually exclusive and declaring both fails at
 `docker compose config`. A host-network container therefore cannot join `pg-net` and cannot
-resolve the name `postgres`.
+resolve Docker network aliases. The HBA allow rule must cover its observed source address.
+
+### ASP.NET Core / Npgsql
+
+Supply the connection string through deployment secrets or ASP.NET Core configuration:
+
+```text
+Host=db.example.com;Port=5432;Database=app_db;Username=app_user;Password=<secret>;SSL Mode=VerifyFull
+```
+
+`VerifyFull` requires TLS, validates certificate trust, and checks the hostname.
+For a private CA absent from the backend OS trust store, append
+`Root Certificate=/app/certs/database-ca.pem`. The backend needs no client certificate.
+`Prefer`, `Require`, and certificate-validation bypasses do not provide this verification.
+
+### Verify application connections
+
+Run through the application's database connection:
+
+```sql
+SELECT ssl, version, cipher FROM pg_stat_ssl WHERE pid = pg_backend_pid();
+```
+
+Expect `ssl = true` and TLS 1.2 or TLS 1.3. From the approved backend source, check
+that `psql` with `sslmode=disable` fails. With `sslmode=verify-full`, check that an
+untrusted CA fails, and that a mismatched `host` with `hostaddr` set to the same server
+IP fails hostname verification. A connection from a denied source must fail even with
+valid credentials and TLS. In Npgsql, repeat the valid connection and rejection checks
+with `SSL Mode=VerifyFull` and `SSL Mode=Disable`.
+
+Inspect the active HBA configuration through the local administrative socket:
+
+```sh
+docker exec -u postgres postgres psql -d postgres -c \
+  'SELECT line_number, type, database, user_name, address, auth_method, error FROM pg_hba_file_rules;'
+```
+
+The `error` column must be empty. After any reload, check server logs for configuration
+errors. Existing connections retain their sessions; changed HBA rules govern new connections.
+
+## TLS files and renewal
+
+The host administrator provisions `PG_TLS_DIR` before `init.sh` runs:
+
+```text
+/opt/databases/tls/db.example.com/
+  fullchain.pem
+  privkey.pem
+```
+
+`fullchain.pem` contains the server certificate followed by intermediate certificates.
+Its SAN must cover the connection hostname. Use an approved public or private CA.
+Public ACME certificates can use DNS-01 validation without opening database or HTTP ports.
+Certificate issuance and deployment are external to this repository.
+
+Confirm the image identity before assigning file ownership:
+
+```sh
+docker run --rm --entrypoint id postgres:18.6-trixie postgres
+docker info --format '{{json .SecurityOptions}}'
+```
+
+For image UID/GID `999:999` with rootful Docker and no user-namespace remapping,
+use owner `999:999` and mode `0600` for `privkey.pem`. The directory can be root-owned
+with mode `0755`, and the certificate root-owned with mode `0644`. Remapped or rootless
+Docker needs corresponding host IDs and directory access, including for the database
+directories managed by `init.sh`.
+
+Verify access through the mount:
+
+```sh
+docker run --rm --user postgres \
+  --mount type=bind,src=/opt/databases/tls/db.example.com,dst=/tls,readonly \
+  --entrypoint sh postgres:18.6-trixie \
+  -c 'test -r /tls/fullchain.pem && test -r /tls/privkey.pem'
+```
+
+Certbot renews its own files; separate copies under `PG_TLS_DIR` require a host-managed
+deployment hook. Scope that hook to the database certificate lineage. Stage the renewed
+certificate and key with correct permissions, verify they match, replace both files in
+the mounted directory, then reload PostgreSQL after both replacements finish:
+
+```sh
+docker exec -u postgres postgres psql -d postgres -c 'SELECT pg_reload_conf();'
+docker compose logs --since=2m postgres
+```
+
+Mount the directory, not individual certificate files, so file replacement is visible
+inside the container. Keep CA signing keys and DNS API credentials outside the TLS mount.
+PostgreSQL retains its previous TLS configuration if reloading invalid files fails;
+`pg_reload_conf()` only confirms the reload signal. Check logs and a new TLS connection
+to confirm the renewed certificate is served. Monitor the served certificate's expiry.
+Certbot's renewal dry-run alone does not prove deployment hooks work.
 
 ### Percent-encode credentials
 
@@ -550,9 +668,9 @@ docker run --rm -d --name pg-restore-test --init --user postgres \
   postgres -p 5433
 
 docker logs pg-restore-test 2>&1 | grep -E 'recovery stopping|selected new timeline|ready to accept'
-docker exec pg-restore-test psql -p 5433 -U postgres -Atc \
+docker exec -u postgres pg-restore-test psql -p 5433 -U postgres -Atc \
   'SELECT datname FROM pg_database ORDER BY 1'
-docker exec pg-restore-test psql -p 5433 -U postgres -d app_db -Atc \
+docker exec -u postgres pg-restore-test psql -p 5433 -U postgres -d app_db -Atc \
   'SELECT count(*) FROM some_table'
 
 docker rm -f pg-restore-test
