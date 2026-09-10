@@ -54,9 +54,12 @@ import sys
 
 try:
     ipaddress.IPv4Address(os.environ['PG_BIND_ADDRESS'])
-    cidr = os.environ['PG_APP_ALLOWED_CIDR']
-    if not re.fullmatch(r'[0-9a-fA-F:.]+/[0-9]+', cidr) or ipaddress.ip_network(cidr).prefixlen == 0:
-        raise ValueError('PG_APP_ALLOWED_CIDR must be an explicit, restricted network CIDR')
+    cidrs = os.environ['PG_APP_ALLOWED_CIDR'].split()
+    if not cidrs:
+        raise ValueError('PG_APP_ALLOWED_CIDR must contain at least one network CIDR')
+    for cidr in cidrs:
+        if not re.fullmatch(r'[0-9a-fA-F:.]+/[0-9]+', cidr) or ipaddress.ip_network(cidr).prefixlen == 0:
+            raise ValueError(f'PG_APP_ALLOWED_CIDR contains an invalid or unrestricted CIDR: {cidr}')
     port = os.environ['PG_PORT']
     if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise ValueError('PG_PORT must be between 1 and 65535')
@@ -115,10 +118,21 @@ chmod 640 "$PG_BASE_DIR/conf/pgbackrest.conf"
 
 # Write in place so an existing file bind mount sees the new content.
 echo "Rendering pg_hba.conf..."
-sed -e "s|\${PG_APP_DB}|${PG_APP_DB}|g" \
-    -e "s|\${PG_APP_USER}|${PG_APP_USER}|g" \
-    -e "s|\${PG_APP_ALLOWED_CIDR}|${PG_APP_ALLOWED_CIDR}|g" \
-    "$SCRIPT_DIR/pg_hba.conf.template" > "$PG_BASE_DIR/conf/pg_hba.conf"
+python3 - "$SCRIPT_DIR/pg_hba.conf.template" <<'PY' > "$PG_BASE_DIR/conf/pg_hba.conf"
+import os
+from pathlib import Path
+import sys
+
+template = Path(sys.argv[1]).read_text()
+template = template.replace('${PG_APP_DB}', os.environ['PG_APP_DB'])
+template = template.replace('${PG_APP_USER}', os.environ['PG_APP_USER'])
+for line in template.splitlines(keepends=True):
+    if '${PG_APP_ALLOWED_CIDR}' in line:
+        for cidr in os.environ['PG_APP_ALLOWED_CIDR'].split():
+            sys.stdout.write(line.replace('${PG_APP_ALLOWED_CIDR}', cidr))
+    else:
+        sys.stdout.write(line)
+PY
 chown 999:999 "$PG_BASE_DIR/conf/pg_hba.conf"
 chmod 640 "$PG_BASE_DIR/conf/pg_hba.conf"
 

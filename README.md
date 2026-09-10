@@ -104,10 +104,26 @@ uses its read-only mount at `/etc/postgresql/pg_hba.conf`. The active rules perm
 `peer` administration, reject plaintext TCP, and permit TLS/SCRAM access for `PG_APP_USER`
 to `PG_APP_DB` from `PG_APP_ALLOWED_CIDR`. Unmatched connections are rejected.
 
-`PG_APP_ALLOWED_CIDR` accepts one explicit IPv4 or IPv6 network. `/0` is rejected.
+`PG_APP_ALLOWED_CIDR` accepts one explicit IPv4 or IPv6 network, or a quoted,
+space-separated list. `init.sh` generates one application rule per entry. Empty lists,
+malformed CIDRs, and `/0` are rejected.
+
+```dotenv
+PG_APP_ALLOWED_CIDR=192.0.2.10/32
+# Multiple clients, including IPv6:
+# PG_APP_ALLOWED_CIDR='192.0.2.10/32 192.0.2.11/32 2001:db8::10/128'
+```
+
 Names in the HBA rule are quoted to prevent interpretation as special HBA keywords.
-Additional source networks require explicit template rules. Re-running `init.sh`
-renders and reloads the policy; it also resets passwords as described in Setup.
+Re-running `init.sh` renders and reloads the policy from `.env` and the template,
+overwriting manual edits to `/opt/databases/postgresql/conf/pg_hba.conf`.
+It also builds the image and resets passwords as described in Setup.
+
+For temporary testing, edit the host-mounted authentication file, check
+`pg_hba_file_rules` for errors, and run `SELECT pg_reload_conf();` through the local
+administrative socket. Authentication changes govern new connections without a restart;
+existing sessions remain connected. Persist intended deployment changes in `.env` or
+the template before the next initialization run.
 
 The TCP healthcheck uses `pg_isready` to check server readiness. It does not prove
 authentication or TLS validation. Use the connection checks below for that purpose.
