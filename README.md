@@ -10,6 +10,44 @@ The image is the official `postgres:18.6-trixie` with `pgbackrest` layered on fr
 apt repository the base image already configures. pgBackRest has to live in that image rather
 than a sidecar container because `archive_command` is executed by the `postgres` process itself.
 
+Guides: [Self-managed client CA and mTLS setup](MTLS-SETUP.md),
+[TLS and mTLS explained](TLS-MTLS-EXPLAINED.md).
+
+## Table of contents
+
+- [Layout](#layout)
+- [Setup](#setup)
+  - [Roles](#roles)
+- [Configuration](#configuration)
+  - [Authentication modes](#authentication-modes)
+  - [Collation](#collation)
+- [Connecting](#connecting)
+  - [From another compose project on the same host](#from-another-compose-project-on-the-same-host)
+  - [From a container using host networking](#from-a-container-using-network_mode-host)
+  - [ASP.NET Core / Npgsql](#aspnet-core--npgsql)
+  - [Verify application connections](#verify-application-connections)
+- [TLS files and renewal](#tls-files-and-renewal)
+  - [Additional mTLS prerequisites](#additional-mtls-prerequisites)
+  - [Permissions and renewal](#permissions-and-renewal)
+  - [Percent-encode credentials](#percent-encode-credentials)
+- [Sizing](#sizing)
+  - [Asynchronous I/O](#asynchronous-io)
+- [Huge pages](#huge-pages)
+  - [Transparent huge pages](#transparent-huge-pages)
+- [Backups](#backups)
+  - [Why a stuck archive is dangerous here](#why-a-stuck-archive-is-dangerous-here)
+  - [What actually breaks the archive](#what-actually-breaks-the-archive)
+  - [The guard](#the-guard)
+  - [The backstop](#the-backstop)
+  - [Manual checks](#manual-checks)
+- [Restore](#restore)
+  - [Verifying without touching the live cluster](#verifying-without-touching-the-live-cluster)
+- [Upgrades](#upgrades)
+  - [Minor version](#minor-version)
+  - [Major version](#major-version)
+- [Monitoring](#monitoring)
+- [Connection pooling](#connection-pooling)
+
 ## Layout
 
 | Path | Contents |
