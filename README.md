@@ -126,8 +126,12 @@ administrative socket. Authentication changes govern new connections without a r
 existing sessions remain connected. Persist intended deployment changes in `.env` or
 the template before the next initialization run.
 
-The TCP healthcheck uses `pg_isready` to check server readiness. It does not prove
-authentication or TLS validation. Use the connection checks below for that purpose.
+`healthcheck.sh`, installed in the image as `postgres-healthcheck`, queries PostgreSQL
+through the Unix socket as the `postgres` OS user using `peer` authentication. It requires
+nonempty `listen_addresses`, so the image's temporary initialization server is not ready.
+Docker and the initialization wait use the same probe. It checks local query readiness
+and TCP configuration, not remote reachability or TLS validation. Use the connection
+checks below for those purposes.
 
 `postgresql.auto.conf` in `PGDATA` is read after `postgresql.conf`, so `ALTER SYSTEM` still works
 and still wins. A setting that appears not to take effect after a restart is usually one that

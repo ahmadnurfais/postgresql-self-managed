@@ -189,19 +189,13 @@ chmod 640 "$PG_BASE_DIR/conf/auth.conf"
 echo "Starting PostgreSQL..."
 docker compose -f "$SCRIPT_DIR/docker-compose.yml" up -d postgres
 
-# Accepting connections on the socket is not enough. On a fresh data directory
-# the entrypoint first runs a temporary server with listen_addresses='' to run
-# initdb and create the superuser, then stops it and starts the real one. That
-# temporary server answers on the Unix socket, so a socket-based check returns
-# during initialisation and the pgbackrest commands below then run against a
-# server that is about to shut down. Checking over TCP separates the two: only
-# the real server listens on the port.
-echo "Waiting for PostgreSQL to accept TCP connections..."
+# The shared socket probe rejects the temporary server with listen_addresses=''.
+echo "Waiting for PostgreSQL readiness..."
 attempts=0
-until docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -p 5432 -U postgres -q 2>/dev/null; do
+until docker exec -u postgres "$CONTAINER" /usr/local/bin/postgres-healthcheck >/dev/null 2>&1; do
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 60 ]; then
-        echo "Error: PostgreSQL did not become ready within 120 seconds. Check docker compose logs postgres."
+        echo "Error: PostgreSQL did not become ready after 60 checks. Check docker compose logs postgres."
         exit 1
     fi
     echo "Waiting..."

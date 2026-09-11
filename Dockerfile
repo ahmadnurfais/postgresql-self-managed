@@ -9,3 +9,5 @@ ARG PGBACKREST_VERSION=2.59.1-1.pgdg13+1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends "pgbackrest=${PGBACKREST_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=755 healthcheck.sh /usr/local/bin/postgres-healthcheck
